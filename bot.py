@@ -3,10 +3,10 @@
 # DISCORD_TOKEN, OPENAI_API_KEY
 # GOOGLE_SERVICE_ACCOUNT_JSON_TEXT, GOOGLE_SHEET_ID
 # TRADES_TAB, ACTIVE_TRADES_TAB, PARTIALS_TAB, SIGNALS_TAB, EVENTS_TAB
-# OPENAI_MODEL, OPENAI_MODEL_FALLBACK
+# OPENAI_MODEL, OPENAI_MODEL_FALLBACK, GPT_BEHAVIOR
 # TRADIER_LIVE_API_KEY, TRADIER_SANDBOX_API_KEY, TRADIER_SANDBOX_ACCOUNT_ID
 # EXTENDED_LIMIT_SLIPPAGE_BPS, EXTENDED_STOCK_ENABLED
-# Optional: TIMEZONE (default America/New_York), GPT_SYSTEM_PROMPT
+# Optional: TIMEZONE (default America/New_York)
 
 import os, json, requests, asyncio, traceback, discord
 from datetime import datetime
@@ -44,13 +44,8 @@ except Exception:
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_MODEL_FALLBACK = os.getenv("OPENAI_MODEL_FALLBACK", "gpt-4o-mini")
 
-GPT_SYSTEM_PROMPT = os.getenv(
-    "GPT_SYSTEM_PROMPT",
-    "You are TradeAlertBot. Extract trading intents precisely. "
-    "Ask for missing details. Only immediate market orders require confirmation; "
-    "conditional and limit/stop orders execute without confirmation. "
-    "Always log key steps succinctly."
-)
+# IMPORTANT: behavior comes ONLY from env (no code fallback)
+GPT_BEHAVIOR = os.environ["GPT_BEHAVIOR"]
 
 # ---------- Google Sheets (one spreadsheet; multiple tabs) ----------
 GSHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
@@ -218,9 +213,7 @@ def place_option_order_by_occ(occ: str, side: str, qty: int, type: str = "market
     Respects confirmation policy: market only; conditional orders skip confirmation.
     """
     if needs_confirmation(type, is_conditional):
-        # In your real flow, you'd stage and ask user; here we just log a policy note.
         log_event("policy","out","bot", None, None, {"confirm_required": True, "reason": "market order", "occ": occ})
-        # You can raise or return a message; keeping passive here:
     underlying = (underlying or _infer_underlying_from_occ(occ))
     payload = {
         "class": "option",
@@ -232,7 +225,6 @@ def place_option_order_by_occ(occ: str, side: str, qty: int, type: str = "market
         "duration": duration,
     }
     if limit is not None and payload["type"] in ("limit","stop_limit"):
-        # Apply slippage policy if provided (bps)
         if EXTENDED_LIMIT_SLIPPAGE_BPS:
             limit = float(limit) * (1 + EXTENDED_LIMIT_SLIPPAGE_BPS/10000.0)
         payload["price"] = float(limit)
@@ -284,14 +276,14 @@ async def gpt_orchestrate(user_text: str, channel_id: str, user_id: str) -> str:
         try:
             resp = _openai.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=[{"role":"system","content": GPT_SYSTEM_PROMPT},
+                messages=[{"role":"system","content": GPT_BEHAVIOR},
                           {"role":"user","content": user_text}]
             )
         except Exception:
             # fallback model
             resp = _openai.chat.completions.create(
                 model=OPENAI_MODEL_FALLBACK,
-                messages=[{"role":"system","content": GPT_SYSTEM_PROMPT},
+                messages=[{"role":"system","content": GPT_BEHAVIOR},
                           {"role":"user","content": user_text}]
             )
         reply = resp.choices[0].message.content
