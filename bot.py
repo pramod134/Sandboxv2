@@ -139,7 +139,11 @@ def tradier_data_request(endpoint: str, method: str = "GET", params=None, data=N
 
 def tradier_trade_request(endpoint: str, method: str = "GET", params=None, data=None):
     url = f"{TRADE_BASE}{endpoint}"
-    headers = {"Authorization": f"Bearer {TRADE_TOKEN}", "Accept": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {TRADE_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
     log_event("broker","out","bot", None, None, {"client":"TRADE","endpoint":endpoint,"method":method,"params":params,"data":data})
     r = requests.request(method, url, headers=headers, params=params, data=data, timeout=20)
     if not r.ok:
@@ -163,20 +167,35 @@ def get_history(symbol: str, interval="hour", start: Optional[str]=None, end: Op
     return tradier_data_request("/markets/history", params=params)
 
 # ---------- Trading (SANDBOX) ----------
+def _infer_underlying_from_occ(occ: str) -> str:
+    """
+    Best-effort extraction of underlying from OCC symbol:
+    e.g., AMD250822C00185000 -> 'AMD'
+    """
+    for i, ch in enumerate(occ):
+        if ch.isdigit():
+            return occ[:i].upper()
+    return occ[:4].upper()
+
 def place_option_order_by_occ(occ: str, side: str, qty: int, type: str = "market",
                               limit: Optional[float] = None, stop: Optional[float] = None,
-                              duration: str = "day") -> dict:
+                              duration: str = "day", underlying: Optional[str] = None) -> dict:
+    """
+    FIX: send BOTH 'symbol' (underlying) and 'option_symbol' (OCC) when class=option.
+    """
+    underlying = (underlying or _infer_underlying_from_occ(occ))
     payload = {
         "class": "option",
-        "symbol": occ,           # OCC string accepted by Tradier
-        "side": side,            # buy_to_open, sell_to_close, etc.
+        "symbol": underlying,        # underlying ticker (e.g., AMD)
+        "option_symbol": occ,        # OCC e.g., AMD250822C00185000
+        "side": side,                # buy_to_open, sell_to_close, etc.
         "quantity": int(qty),
         "type": type.lower(),
         "duration": duration,
     }
-    if limit is not None and type.lower() in ("limit","stop_limit"):
+    if limit is not None and payload["type"] in ("limit","stop_limit"):
         payload["price"] = float(limit)
-    if stop is not None and type.lower() in ("stop","stop_limit"):
+    if stop is not None and payload["type"] in ("stop","stop_limit"):
         payload["stop"] = float(stop)
     res = tradier_trade_request(f"/accounts/{TRADE_ACCT}/orders", method="POST", data=payload)
     log_trade(side, occ, qty, res)
