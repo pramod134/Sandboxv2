@@ -9,7 +9,7 @@
 # Optional: TIMEZONE (default America/New_York)
 
 import os, json, requests, asyncio, traceback, discord
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Literal
 
 # ---------- Timezone ----------
@@ -32,6 +32,11 @@ def now_iso():
         return datetime.now(timezone.utc).isoformat()
     except Exception:
         return datetime.utcnow().isoformat()
+
+def now_dt():
+    if _TZ:
+        return datetime.now(_TZ)
+    return datetime.utcnow()
 
 # ---------- OpenAI (GPT) ----------
 try:
@@ -292,6 +297,35 @@ async def gpt_orchestrate(user_text: str, channel_id: str, user_id: str) -> str:
     except Exception as e:
         return f"GPT error: {e}"
 
+# ---------- Confirmation Queue (NEW) ----------
+PENDING_CONFIRM = {}  # key: channel_id -> {user_id, original_text, expires_at}
+
+CONFIRM_WORDS = {"confirm", "yes", "y", "proceed", "go", "send", "do it"}
+CANCEL_WORDS  = {"cancel", "no", "n", "stop", "abort"}
+
+def _set_pending(channel_id: str, user_id: str, original_text: str, ttl_seconds: int = 120):
+    PENDING_CONFIRM[channel_id] = {
+        "user_id": user_id,
+        "original_text": original_text,
+        "expires_at": now_dt() + timedelta(seconds=ttl_seconds)
+    }
+    log_event("confirm","set","bot", channel_id, user_id, {"original_text": original_text, "ttl_s": ttl_seconds})
+
+def _get_pending(channel_id: str):
+    p = PENDING_CONFIRM.get(channel_id)
+    if not p:
+        return None
+    if now_dt() > p["expires_at"]:
+        log_event("confirm","expired","bot", channel_id, p.get("user_id"), {"original_text": p.get("original_text")})
+        PENDING_CONFIRM.pop(channel_id, None)
+        return None
+    return p
+
+def _clear_pending(channel_id: str, reason: str = "cleared"):
+    p = PENDING_CONFIRM.pop(channel_id, None)
+    if p:
+        log_event("confirm", reason, "bot", channel_id, p.get("user_id"), {"original_text": p.get("original_text")})
+
 # ---------- Discord ----------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 intents = discord.Intents.default()
@@ -311,36 +345,72 @@ async def on_message(message: discord.Message):
     if not content:
         return
 
+    ch_id = str(message.channel.id)
+    u_id  = str(message.author.id)
+
     # Discord IN
     try:
-        log_event("discord","in","user", str(message.channel.id), str(message.author.id), content)
+        log_event("discord","in","user", ch_id, u_id, content)
     except Exception:
         pass
 
+    # Confirmation / Cancel handling (NEW)
+    lower = content.lower()
+    if lower in CONFIRM_WORDS or lower in CANCEL_WORDS:
+        pending = _get_pending(ch_id)
+        if not pending:
+            await message.channel.send("I don't have anything pending confirmation.")
+            return
+        if pending["user_id"] != u_id:
+            await message.channel.send("Only the original requester can confirm or cancel this.")
+            return
+
+        if lower in CANCEL_WORDS:
+            _clear_pending(ch_id, reason="canceled")
+            await message.channel.send("Okay, canceled.")
+            return
+
+        # Confirm path: resubmit original instruction to GPT prefixed with CONFIRM:
+        original = pending["original_text"]
+        _clear_pending(ch_id, reason="confirmed")
+        reply = await gpt_orchestrate(f"CONFIRM: {original}", ch_id, u_id)
+        await message.channel.send(reply)
+        try:
+            log_conversation(f"CONFIRM: {original}", reply, ch_id, u_id)
+            log_event("discord","out","assistant", ch_id, u_id, reply)
+        except Exception:
+            pass
+        return
+
     # Simple command: quote SYMBOL
-    if content.lower().startswith("quote "):
+    if lower.startswith("quote "):
         sym = content.split(" ",1)[1].strip().upper()
         try:
             q = get_equity_quote(sym)
             text = f"📈 {sym} quote:\n```json\n{json.dumps(q, indent=2)}```"
             await message.channel.send(text)
-            log_conversation(content, text, str(message.channel.id), str(message.author.id))
-            log_event("discord","out","assistant", str(message.channel.id), str(message.author.id), {"quote_symbol": sym})
+            log_conversation(content, text, ch_id, u_id)
+            log_event("discord","out","assistant", ch_id, u_id, {"quote_symbol": sym})
             return
         except Exception as e:
             err = f"❌ Quote error: {e}"
             await message.channel.send(err)
-            log_event("system","error","bot", str(message.channel.id), str(message.author.id), err)
+            log_event("system","error","bot", ch_id, u_id, err)
             return
 
     # Default: send to GPT
-    reply = await gpt_orchestrate(content, str(message.channel.id), str(message.author.id))
+    reply = await gpt_orchestrate(content, ch_id, u_id)
     await message.channel.send(reply)
     try:
-        log_conversation(content, reply, str(message.channel.id), str(message.author.id))
-        log_event("discord","out","assistant", str(message.channel.id), str(message.author.id), reply)
+        log_conversation(content, reply, ch_id, u_id)
+        log_event("discord","out","assistant", ch_id, u_id, reply)
     except Exception:
         pass
+
+    # If GPT asked for confirmation, queue it (NEW)
+    # naive heuristic: look for the word "confirm" in GPT reply
+    if "confirm" in reply.lower():
+        _set_pending(ch_id, u_id, content)
 
 # ---------- Entrypoint ----------
 def main():
